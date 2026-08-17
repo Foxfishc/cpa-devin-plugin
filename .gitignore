@@ -1,0 +1,22 @@
+# Build artifacts
+*.so
+*.dll
+*.h
+*.exe
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local CLIProxyAPI checkout (used by CI)
+_cliproxy/
