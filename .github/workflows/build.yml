@@ -1,6 +1,7 @@
-name: Build Devin Plugin
+name: Build
 
 on:
+  pull_request:
   push:
     tags: ["v*"]
   workflow_dispatch:
@@ -8,25 +9,13 @@ on:
 permissions:
   contents: write
 
-jobs:
-  build:
-    name: Build ${{ matrix.os }}-${{ matrix.arch }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: linux
-            arch: amd64
-            runner: ubuntu-latest
-            goarch: amd64
-            output: devin-desktop.so
-          - os: windows
-            arch: amd64
-            runner: windows-latest
-            goarch: amd64
-            output: devin-desktop.dll
+env:
+  PLUGIN_ID: devin-desktop
 
+jobs:
+  test:
+    name: Test & Vet
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout plugin
         uses: actions/checkout@v4
@@ -42,41 +31,136 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.26"
+          cache: true
 
       - name: Adjust replace directive
-        shell: bash
         run: |
-          # Point the replace directive at the checked-out CLIProxyAPI tree.
           go mod edit -replace github.com/router-for-me/CLIProxyAPI/v7=./_cliproxy
           go mod tidy
 
-      - name: Build plugin (Linux)
-        if: matrix.os == 'linux'
-        run: |
-          CGO_ENABLED=1 go build -buildmode=c-shared -o devin-desktop.so .
+      - name: Vet
+        run: go vet ./...
 
-      - name: Build plugin (Windows)
-        if: matrix.os == 'windows'
-        run: |
-          $env:CGO_ENABLED = "1"
-          go build -buildmode=c-shared -o devin-desktop.dll .
+      - name: Test
+        run: go test ./...
 
-      - name: Upload artifact
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-24.04
+            ext: so
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-24.04-arm
+            ext: so
+          - goos: darwin
+            goarch: amd64
+            runner: macos-15-intel
+            ext: dylib
+          - goos: darwin
+            goarch: arm64
+            runner: macos-15
+            ext: dylib
+          - goos: windows
+            goarch: amd64
+            runner: windows-2025
+            ext: dll
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+
+      - name: Checkout CLIProxyAPI
+        uses: actions/checkout@v4
+        with:
+          repository: router-for-me/CLIProxyAPI
+          ref: main
+          path: _cliproxy
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Adjust replace directive
+        run: |
+          go mod edit -replace github.com/router-for-me/CLIProxyAPI/v7=./_cliproxy
+          go mod tidy
+
+      - name: Resolve release metadata
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0-dev"
+          fi
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "LIB_NAME=${PLUGIN_ID}.${{ matrix.ext }}" >> "${GITHUB_ENV}"
+          echo "ARCHIVE_NAME=${PLUGIN_ID}_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip" >> "${GITHUB_ENV}"
+
+      - name: Build shared library
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -buildmode=c-shared \
+              -ldflags "-s -w" \
+              -o "dist/${LIB_NAME}" .
+          rm -f "dist/${PLUGIN_ID}.h"
+
+      - name: Package plugin
+        run: |
+          set -euo pipefail
+          go run ./.github/scripts/package-release.go \
+            -library "dist/${LIB_NAME}" \
+            -archive "${ARCHIVE_NAME}" \
+            -checksum "${ARCHIVE_NAME}.sha256"
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: devin-desktop-${{ matrix.os }}-${{ matrix.arch }}
+          name: ${{ env.ARCHIVE_NAME }}
           path: |
-            devin-desktop.so
-            devin-desktop.dll
-            devin-desktop.h
-          if-no-files-found: ignore
+            ${{ env.ARCHIVE_NAME }}
+            ${{ env.ARCHIVE_NAME }}.sha256
+          if-no-files-found: error
 
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
         with:
-          files: |
-            devin-desktop.so
-            devin-desktop.dll
-            devin-desktop.h
-          fail_on_unmatched_files: false
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          sort dist/*.sha256 > dist/checksums.txt
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" dist/*.zip dist/checksums.txt --clobber --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/*.zip dist/checksums.txt \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --title "${GITHUB_REF_NAME}" \
+              --notes "Automated release for ${GITHUB_REF_NAME}."
+          fi

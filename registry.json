@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "devin-desktop",
+      "name": "Devin Desktop",
+      "description": "Adds Devin Desktop (formerly Windsurf/Codeium Cascade) as a first-class OAuth provider, model provider, and executor. Supports browser one-time-token login, local Desktop credential import, streaming chat, and model discovery via the native Devin Connect-RPC API.",
+      "author": "Foxfishc",
+      "version": "0.1.0",
+      "repository": "https://github.com/Foxfishc/cpa-devin-plugin",
+      "homepage": "https://github.com/Foxfishc/cpa-devin-plugin",
+      "license": "MIT",
+      "tags": [
+        "Provider",
+        "Executor",
+        "OAuth",
+        "Devin"
+      ]
+    }
+  ]
+}
