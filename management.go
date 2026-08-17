@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -18,8 +19,15 @@ type managementRegistrationResponse struct {
 }
 
 type submitTokenRequest struct {
-	State string `json:"state"`
+	State string `json:"state,omitempty"`
 	Token string `json:"token"`
+}
+
+type submitTokenResponse struct {
+	Status   string `json:"status"`
+	Email    string `json:"email,omitempty"`
+	Error    string `json:"error,omitempty"`
+	FileName string `json:"file_name,omitempty"`
 }
 
 // handleManagementRegister declares the plugin-owned token submission route.
@@ -33,6 +41,12 @@ func handleManagementRegister() ([]byte, error) {
 }
 
 // handleManagementHandle processes plugin-owned Management API requests.
+//
+// When a token is submitted with a matching pending login state, the token is
+// stored for that flow and the host polling mechanism picks it up.
+// When a token is submitted without a state (or with an unknown state), the
+// plugin performs the full exchange and credential save synchronously so the
+// user only needs one call.
 func handleManagementHandle(raw []byte) ([]byte, error) {
 	var req pluginapi.ManagementRequest
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
@@ -55,28 +69,60 @@ func handleManagementHandle(raw []byte) ([]byte, error) {
 	if token == "" {
 		token = strings.TrimSpace(req.Query.Get("token"))
 	}
-	if state == "" || token == "" {
-		return okEnvelope(managementJSON(http.StatusBadRequest, map[string]string{"error": "state and token are required"}))
+	if token == "" {
+		return okEnvelope(managementJSON(http.StatusBadRequest, map[string]string{"error": "token is required"}))
 	}
-	entryRaw, ok := pendingLogins.Load(state)
-	if !ok {
-		return okEnvelope(managementJSON(http.StatusNotFound, map[string]string{"error": "unknown or expired login state"}))
+
+	// If a valid pending login state is provided, store the token for the
+	// polling flow and return immediately.
+	if state != "" {
+		entryRaw, ok := pendingLogins.Load(state)
+		if ok {
+			entry, _ := entryRaw.(*pendingLogin)
+			if entry != nil {
+				entry.mu.Lock()
+				expired := time.Now().After(entry.expiresAt)
+				if !expired {
+					entry.token = token
+				}
+				entry.mu.Unlock()
+				if expired {
+					pendingLogins.Delete(state)
+					return okEnvelope(managementJSON(http.StatusGone, map[string]string{"error": "login flow expired"}))
+				}
+				return okEnvelope(managementJSON(http.StatusOK, submitTokenResponse{Status: "ok"}))
+			}
+		}
 	}
-	entry, _ := entryRaw.(*pendingLogin)
-	if entry == nil {
-		return okEnvelope(managementJSON(http.StatusNotFound, map[string]string{"error": "invalid login state"}))
+
+	// No state or unknown state: do the full exchange + save synchronously.
+	cfg := loadedConfig()
+	if !cfg.Enabled {
+		return okEnvelope(managementJSON(http.StatusForbidden, map[string]string{"error": "devin: plugin is disabled"}))
 	}
-	entry.mu.Lock()
-	expired := time.Now().After(entry.expiresAt)
-	if !expired {
-		entry.token = token
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	storage, errLogin := loginWithOneTimeToken(ctx, cfg, token, sourceBrowser)
+	if errLogin != nil {
+		return okEnvelope(managementJSON(http.StatusOK, submitTokenResponse{Status: "error", Error: errLogin.Error()}))
 	}
-	entry.mu.Unlock()
-	if expired {
-		pendingLogins.Delete(state)
-		return okEnvelope(managementJSON(http.StatusGone, map[string]string{"error": "login flow expired"}))
+	rawStorage, errMarshal := json.Marshal(storage)
+	if errMarshal != nil {
+		return okEnvelope(managementJSON(http.StatusInternalServerError, map[string]string{"error": "failed to encode credential"}))
 	}
-	return okEnvelope(managementJSON(http.StatusOK, map[string]string{"status": "ok"}))
+	fileName := credentialFileName(storage.Email)
+	_, errSave := callHost("host.auth.save", map[string]any{
+		"name": fileName,
+		"json": json.RawMessage(rawStorage),
+	})
+	if errSave != nil {
+		return okEnvelope(managementJSON(http.StatusOK, submitTokenResponse{Status: "error", Error: "failed to save credential: " + errSave.Error()}))
+	}
+	return okEnvelope(managementJSON(http.StatusOK, submitTokenResponse{
+		Status:   "ok",
+		Email:    storage.Email,
+		FileName: fileName,
+	}))
 }
 
 // managementJSON builds a JSON Management API response.
