@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -137,7 +139,16 @@ func handleAuthLoginPoll(raw []byte) ([]byte, error) {
 		pendingLogins.Delete(state)
 		return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusError, Message: "login flow expired"})
 	case token == "":
-		return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending, Message: "waiting for the authentication token"})
+		// The host OAuth callback flow writes the code to a file under the auth
+		// directory. When the user submits the token through the management UI's
+		// callback URL field, pick it up here so the polling flow completes
+		// without requiring a separate submit-token API call.
+		if cbToken := readOAuthCallbackToken(req.Host.AuthDir, state); cbToken != "" {
+			token = cbToken
+		}
+		if token == "" {
+			return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending, Message: "waiting for the authentication token"})
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -152,6 +163,33 @@ func handleAuthLoginPoll(raw []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusError, Message: errBuild.Error()})
 	}
 	return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusSuccess, Auth: authData})
+}
+
+// readOAuthCallbackToken reads the code field from the host-written OAuth
+// callback file (.oauth-<provider>-<state>.oauth) when it exists.
+func readOAuthCallbackToken(authDir, state string) string {
+	authDir = strings.TrimSpace(authDir)
+	state = strings.TrimSpace(state)
+	if authDir == "" || state == "" {
+		return ""
+	}
+	fileName := fmt.Sprintf(".oauth-%s-%s.oauth", providerKey, state)
+	data, errRead := os.ReadFile(filepath.Join(authDir, fileName))
+	if errRead != nil {
+		return ""
+	}
+	var payload struct {
+		Code  string `json:"code"`
+		State string `json:"state"`
+		Error string `json:"error"`
+	}
+	if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal != nil {
+		return ""
+	}
+	if strings.TrimSpace(payload.Error) != "" {
+		return ""
+	}
+	return strings.TrimSpace(payload.Code)
 }
 
 // handleAuthRefresh mints a fresh session token for a stored credential.
