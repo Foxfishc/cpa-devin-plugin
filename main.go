@@ -76,8 +76,9 @@ const (
 	pluginName = "devin-desktop"
 	// providerKey is the provider identifier used for auths, models, and execution.
 	providerKey = "devin"
-	// pluginVersion is the plugin release version.
-	pluginVersion = "0.1.0"
+	// pluginVersion is the plugin release version. Override with:
+	//   -ldflags "-X main.pluginVersion=0.3.0"
+	pluginVersion = "0.3.0"
 )
 
 type envelope struct {
